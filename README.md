@@ -266,3 +266,5 @@ Need help?
 ---
 
 **Built with ❤️ for students exploring their career path.**
+<br>
+Author: Junaid Shabeer
