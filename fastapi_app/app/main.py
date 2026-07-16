@@ -71,6 +71,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from storage import ensure_reports_dir                       # UNCHANGED utility
+from app.database import verify_database_connection          # DB health check
 from app.session_store import load_all_sessions_from_disk    # explicit loader
 from app.routers import sessions, reports, config_router
 
@@ -81,6 +82,11 @@ from app.routers import sessions, reports, config_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Verify the database is reachable before accepting any traffic.
+    # verify_database_connection() raises RuntimeError on failure, which
+    # causes Uvicorn to abort startup immediately with a clear error message.
+    verify_database_connection()
+    print("✅  Database connection established successfully.")
     ensure_reports_dir()
     load_all_sessions_from_disk()   # runs AFTER config paths are patched above
     print(f"✅  EduPath AI API ready.  Project root: {_PROJECT_ROOT}")
