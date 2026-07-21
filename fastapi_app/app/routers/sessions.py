@@ -68,7 +68,10 @@ def _apply_step(session, step_number: int, data: dict) -> dict:
     profile.update(data)
     if step_number not in session["steps_completed"]:
         session["steps_completed"].append(step_number)
-    session["current_step"] = step_number + 1
+    if step_number < 21:
+     session["current_step"] = step_number + 1
+    else:
+     session["current_step"] = 21
     save_session_in_memory(session)
     return profile
 

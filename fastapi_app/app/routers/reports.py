@@ -16,10 +16,13 @@ All AI calls are delegated to the UNCHANGED report_generator.py.
 """
 
 import os
+import time
 from fastapi import APIRouter, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse
 
 from app.session_store import get_session, save_session_in_memory
+from app.database import SessionLocal
+from app.models import Report as ReportModel
 from app.schemas import (
     ReportGenerateRequest, ReportResponse,
     FieldScopeRequest, FieldScopeResponse,
@@ -77,12 +80,51 @@ def generate_career(body: ReportGenerateRequest):
             detail="Interview is not yet complete. Finish all 21 steps first.",
         )
 
+    t_start = time.monotonic()
+
     try:
         report_text = generate_career_report(profile)   # UNCHANGED function
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"AI generation failed: {exc}")
 
+    duration_ms = int((time.monotonic() - t_start) * 1000)
     pdf_path = save_report(report_text, profile)         # UNCHANGED function
+
+    # ── Persist the Report row to PostgreSQL ──────────────────────────────────
+    # The old code only wrote ai_report_text and report_file_path back into the
+    # session dict, which was lost on restart.  Now we insert a proper Report
+    # row so _get_latest_report_content() in session_repository.py can find it,
+    # and GET /reports/career/{id}/download works after a server restart.
+    db = SessionLocal()
+    try:
+        # Resolve the session UUID from the session_code stored in profile dict
+        from sqlalchemy import select
+        from app.models import Session as SessionModel
+        stmt = select(SessionModel).where(
+            SessionModel.session_code == body.session_id
+        )
+        db_session = db.scalars(stmt).first()
+        session_uuid = db_session.id if db_session else None
+
+        report_row = ReportModel(
+            session_id=session_uuid,
+            user_id=None,                 # populated when auth layer is added
+            report_type="career",
+            report_text=report_text or "",
+            pdf_path=pdf_path or "",
+            status="complete",
+            generation_duration_ms=duration_ms,
+        )
+        db.add(report_row)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"  >> Warning: could not persist Report row to DB: {e}")
+    finally:
+        db.close()
+
+    # Also update the session dict so the router response and in-flight
+    # callers see the values immediately (matches old behaviour exactly).
     profile["report_generated"] = True
     session["ai_report_text"] = report_text
     session["report_file_path"] = pdf_path or ""
@@ -118,12 +160,37 @@ def generate_scope(body: FieldScopeRequest):
     Generates a standalone Field Scope report for any named field.
     No session or student profile is required.
     """
+    t_start = time.monotonic()
+
     try:
         report_text = generate_field_scope_report(body.field_name)   # UNCHANGED
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"AI generation failed: {exc}")
 
+    duration_ms = int((time.monotonic() - t_start) * 1000)
     pdf_path = save_field_scope_report(report_text, body.field_name)  # UNCHANGED
+
+    # ── Persist the Report row to PostgreSQL ──────────────────────────────────
+    # Field-scope reports are not tied to a session, so session_id is NULL.
+    # They are standalone reference reports for any field of interest.
+    db = SessionLocal()
+    try:
+        report_row = ReportModel(
+            session_id=None,              # field-scope needs no session
+            user_id=None,                 # populated when auth layer is added
+            report_type="field_scope",
+            report_text=report_text or "",
+            pdf_path=pdf_path or "",
+            status="complete",
+            generation_duration_ms=duration_ms,
+        )
+        db.add(report_row)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"  >> Warning: could not persist Field Scope Report row to DB: {e}")
+    finally:
+        db.close()
 
     return FieldScopeResponse(
         field_name=body.field_name,
@@ -156,12 +223,37 @@ def generate_comparison(body: FieldComparisonRequest):
     Generates a side-by-side Field Comparison report.
     No session or student profile is required.
     """
+    t_start = time.monotonic()
+
     try:
         report_text = generate_field_comparison_report(body.field_names)  # UNCHANGED
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"AI generation failed: {exc}")
 
+    duration_ms = int((time.monotonic() - t_start) * 1000)
     pdf_path = save_field_comparison_report(report_text, body.field_names)  # UNCHANGED
+
+    # ── Persist the Report row to PostgreSQL ──────────────────────────────────
+    # Field-comparison reports are not tied to a session, so session_id is NULL.
+    # They are standalone reference reports comparing multiple fields.
+    db = SessionLocal()
+    try:
+        report_row = ReportModel(
+            session_id=None,                # field-comparison needs no session
+            user_id=None,                   # populated when auth layer is added
+            report_type="field_comparison",
+            report_text=report_text or "",
+            pdf_path=pdf_path or "",
+            status="complete",
+            generation_duration_ms=duration_ms,
+        )
+        db.add(report_row)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"  >> Warning: could not persist Field Comparison Report row to DB: {e}")
+    finally:
+        db.close()
 
     return FieldComparisonResponse(
         field_names=body.field_names,

@@ -1,113 +1,118 @@
 """
-session_store.py
-================
-Thread-safe session registry backed by sessions.json via storage.py.
+app/session_store.py
+====================
+Public session API consumed by routers/sessions.py and routers/reports.py.
 
-IMPORTANT: _load_all_sessions_from_disk() is NOT called at import time.
-It is called explicitly from main.py's lifespan() AFTER config paths are
-patched. This guarantees the correct sessions.json path is used.
+This module's PUBLIC FUNCTION SIGNATURES ARE UNCHANGED — every router that
+previously called create_session(), get_session(), save_session_in_memory(),
+delete_session(), and list_session_ids() continues to call them exactly as
+before.  No router file needs to be modified.
+
+What changed (internals only):
+  BEFORE: in-memory dict + sessions.json via storage.py
+  AFTER:  PostgreSQL via app/repositories/session_repository.py
+
+The DB session is obtained from SessionLocal directly here (not via
+Depends(get_db)) because these functions are called from sync router helpers
+that do not participate in FastAPI's dependency injection chain.  Each call
+opens a session, does its work, and closes it — equivalent to the old
+per-call file read/write pattern.
+
+load_all_sessions_from_disk() is retained with its original name so main.py
+does not need to change, but now calls warm_cache_from_db() instead of
+reading sessions.json.
 """
 
-import json
-import os
-import threading
-from typing import Optional, Dict, Any
+from __future__ import annotations
 
-from storage import create_session_state, save_session
-from config import SESSIONS_FILE
+from typing import Any, Dict, List, Optional
 
-
-# ---------------------------------------------------------------------------
-# INTERNAL STORE
-# ---------------------------------------------------------------------------
-
-_lock: threading.Lock = threading.Lock()
-_sessions: Dict[str, Dict[str, Any]] = {}
+from app.database import SessionLocal
+from app.repositories import session_repository as repo
 
 
 # ---------------------------------------------------------------------------
-# STARTUP LOADER  (called explicitly from main.py lifespan — NOT at import)
+# INTERNAL DB SESSION FACTORY
+#
+# Opens a fresh SQLAlchemy session, yields it to the caller, then closes it.
+# Used as a context manager so the session is always closed even on error.
+# ---------------------------------------------------------------------------
+
+from contextlib import contextmanager
+from sqlalchemy.orm import Session as DBSession
+
+
+@contextmanager
+def _db():
+    """Provide a transactional SQLAlchemy session, closed on exit."""
+    db: DBSession = SessionLocal()
+    try:
+        yield db
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# STARTUP LOADER
+# Called explicitly from main.py lifespan() — signature unchanged.
 # ---------------------------------------------------------------------------
 
 def load_all_sessions_from_disk() -> None:
     """
-    Reads sessions.json and loads the stored session into memory.
-    Must be called AFTER config paths are patched in main.py.
+    Previously read sessions.json into the in-memory dict.
+    Now validates the DB connection and logs active session count.
+    Name is kept unchanged so main.py requires no modification.
     """
-    sessions_file = SESSIONS_FILE   # read at call time, after patch
-    if not os.path.exists(sessions_file):
-        print(f"  >> No sessions.json found at {sessions_file} — starting fresh.")
-        return
-    try:
-        with open(sessions_file, "r", encoding="utf-8") as f:
-            session = json.load(f)
-        profile = session.get("student_profile", {})
-        sid = profile.get("session_id")
-        if sid:
-            with _lock:
-                _sessions[sid] = session
-            print(f"  >> Loaded session '{sid}' from {sessions_file}")
-        else:
-            print(f"  >> sessions.json found but contains no session_id — skipped.")
-    except (IOError, OSError, json.JSONDecodeError) as e:
-        print(f"  >> Warning: could not load sessions from disk: {e}")
+    with _db() as db:
+        repo.warm_cache_from_db(db)
 
 
 # ---------------------------------------------------------------------------
-# INTERNAL DISK WRITER
-# ---------------------------------------------------------------------------
-
-def _persist(session: Dict[str, Any]) -> None:
-    save_session(session)   # storage.py — UNCHANGED
-
-
-# ---------------------------------------------------------------------------
-# PUBLIC API
+# PUBLIC API  (signatures identical to the old implementation)
 # ---------------------------------------------------------------------------
 
 def create_session() -> Dict[str, Any]:
-    session = create_session_state()
-    sid = session["student_profile"]["session_id"]
-    with _lock:
-        _sessions[sid] = session
-    _persist(session)
-    return session
+    """
+    Creates a new Session + empty StudentProfile in PostgreSQL.
+    Returns the session dict (same shape as before).
+    """
+    with _db() as db:
+        return repo.create_session(db)
 
 
 def get_session(session_id: str) -> Optional[Dict[str, Any]]:
-    with _lock:
-        if session_id in _sessions:
-            return _sessions[session_id]
-
-    # Fallback: try reading from disk (handles post-restart case)
-    sessions_file = SESSIONS_FILE
-    if not os.path.exists(sessions_file):
-        return None
-    try:
-        with open(sessions_file, "r", encoding="utf-8") as f:
-            session = json.load(f)
-        profile = session.get("student_profile", {})
-        if profile.get("session_id") == session_id:
-            with _lock:
-                _sessions[session_id] = session
-            return session
-    except (IOError, OSError, json.JSONDecodeError):
-        pass
-    return None
+    """
+    Fetches a session by its code (e.g. "SES001") from PostgreSQL.
+    Returns the session dict or None if not found.
+    """
+    with _db() as db:
+        return repo.get_session(db, session_id)
 
 
 def save_session_in_memory(session: Dict[str, Any]) -> None:
-    sid = session["student_profile"]["session_id"]
-    with _lock:
-        _sessions[sid] = session
-    _persist(session)
+    """
+    Persists all changes from a session dict back to PostgreSQL.
+    Name is kept unchanged so all callers in routers require no modification.
+    """
+    with _db() as db:
+        repo.save_session(db, session)
 
 
 def delete_session(session_id: str) -> bool:
-    with _lock:
-        return _sessions.pop(session_id, None) is not None
+    """
+    Permanently deletes a session from PostgreSQL.
+    Returns True if deleted, False if not found.
+    """
+    with _db() as db:
+        return repo.delete_session(db, session_id)
 
 
-def list_session_ids() -> list:
-    with _lock:
-        return list(_sessions.keys())
+def list_session_ids() -> List[str]:
+    """
+    Returns all active session codes from PostgreSQL.
+    """
+    with _db() as db:
+        return repo.list_active_sessions(db)
